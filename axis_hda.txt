@@ -1,0 +1,190 @@
+from PySide6 import QtCore, QtUiTools, QtWidgets, QtGui
+from PySide6.QtGui import *
+from PySide6.QtWidgets import *
+from PySide6.QtCore import *
+import os, re, sys, toolutils, subprocess, shutil, time
+import webbrowser
+from datetime import date
+from collections import OrderedDict
+from importlib import reload  # В Python 3 reload находится здесь [cite: 92]
+import shlex
+import hou
+
+def get_format(n):
+    """Определяет расширение файла из меню ноды [cite: 185]"""
+    f = n.parm('format')
+    return f.menuItems()[f.eval()]
+
+def build_path(n, mk):
+    """Собирает путь записи и создает папки [cite: 185-192]"""
+    day = str(date.today().day).zfill(2)
+    month = str(date.today().month).zfill(2)
+    year = str(date.today().year)
+    year_alt = str(date.today().year)[-2:]
+    
+    path = n.evalParm('directory').replace('\\','/')
+    path = path.replace('{DAY}', day).replace('{MONTH}', month)
+    path = path.replace('{YEAR}', year).replace('{YEAR_ALT}', year_alt)
+    
+    levels = []
+    for d in path.split('/'):
+        if d and '{VERSION}' in d:
+            if levels:
+                dirname = '/'.join(levels)
+                if os.path.exists(dirname):
+                    version = 0
+                    versioned = None
+                    while versioned is None or os.path.exists('%s/%s.%s'%(dirname, versioned, get_format(n))):
+                        version += 1
+                        versioned = d.replace('{VERSION}', 'v'+str(version).zfill(3))
+                    d = versioned
+                else:
+                    d = d.replace('{VERSION}', 'v'+str(1).zfill(3))
+        levels.append(d)
+
+    path = '/'.join(levels)
+    folder = os.path.dirname(path)
+    filename = os.path.basename(path)
+
+    if not os.path.isdir(folder) and mk:
+        try:
+            os.makedirs(folder)
+        except:
+            set_nfo(n, 'Unable to create directory.', 1)
+            return [None, None]
+    return folder, filename
+
+def init_settings(n, mplay):
+    """Инициализация настроек флипбука [cite: 100-116]"""
+    nodeDict = {'rmfiles': []}
+    format = get_format(n)
+    
+    mpegPath = n.evalParm('mpegpath').replace('\\','/') if n.evalParm('method') else 'ffmpeg'
+    if sys.platform == "win32" and mpegPath != 'ffmpeg' and not mpegPath.endswith('.exe'):
+        mpegPath += ".exe"
+
+    folder, filename = build_path(n, 1)
+    if not folder: return None
+        
+    nodeDict['folder'] = folder
+    tempfolder = hou.getenv('HOUDINI_TEMP_DIR').replace('\\','/')
+    start = n.evalParm('fx')
+    
+    if format != 'jpg':
+        count = 0
+        flipfolder = '%s/__flipbook%d' % (tempfolder, count)
+        while os.path.isdir(flipfolder):
+            count += 1
+            flipfolder = '%s/__flipbook%d' % (tempfolder, count)
+        if not os.path.isdir(flipfolder): os.makedirs(flipfolder)
+            
+        flippath = '%s/%s.`$F+%i`.jpg' % (flipfolder, filename, abs(start if start < 0 else 0))
+        postpath = '%s/%s.%s' % (folder, filename, format)
+    else:
+        flippath = '%s/%s.$F.%s' % (folder, filename, format)
+        flipfolder = os.path.dirname(flippath)
+        postpath = flippath
+
+    scene_view = toolutils.sceneViewer()
+    flipbook_options = scene_view.flipbookSettings().stash()
+    
+    a, b, inc = n.evalParmTuple('f') if n.evalParm('trange') else (hou.frame(), hou.frame(), 1)
+    nodeDict['framelist'] = range(int(a), int(b) + 1)
+    
+    res = n.parmTuple('res').eval() if n.evalParm('resscale') == 1 else scene_view.curViewport().resolutionInPixels()
+    resx, resy = int(res[0]), int(res[1])
+    if resx % 2: resx -= 1
+    if resy % 2: resy -= 1
+    
+    flipbook_options.resolution((resx, resy))
+    flipbook_options.useResolution(1)
+    flipbook_options.output(flippath)
+    flipbook_options.outputToMPlay(mplay)
+    flipbook_options.leaveFrameAtEnd(True)
+    
+    if format != 'jpg':
+        input_seq = '%s/%s.%%d.jpg' % (flipfolder, filename)
+        fps = str(int(hou.fps()))
+        # Базовая команда для MP4
+        cmd = [mpegPath, '-start_number', str(int(abs(start))), '-framerate', fps, '-i', input_seq, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', postpath]
+        nodeDict['cmd'] = cmd
+
+    nodeDict.update({'flipbook_options': flipbook_options, 'flipfolder': flipfolder, 'postpath': postpath})
+    nodeDict['saveHIP'] = n.evalParm('hipop') in [1, 3, 4, 6, 7]
+    return nodeDict
+
+def flipBook(n):
+    """Новая безопасная функция запуска флипбука без QApplication.processEvents [cite: 137-183]"""
+    scene_view = toolutils.sceneViewer()
+    mplay = n.evalParm('exe') == 2
+    
+    # 1. Подготовка настроек
+    with hou.undos.disabler():
+        nd = init_settings(n, mplay)
+    if not nd: return
+
+    # 2. Инициализация окна прогресса (axis_utils.wipUI)
+    from axis_utils import wipUI
+    reload(wipUI)
+    
+    flipUI = None
+    for entry in QtWidgets.QApplication.allWidgets():
+        if type(entry).__name__ == 'flipbook_ui':
+            flipUI = entry
+            break
+    if not flipUI: 
+        flipUI = wipUI.flipbook_ui()
+    
+    # Сброс интерфейса перед рендером
+    ui_data = {nd['flipfolder']: {'node': n, 'total': len(nd['framelist']), 'cmd': nd.get('cmd')}}
+    flipUI.reset(ui_data)
+    flipUI.show()
+
+    # 3. РЕНДЕР (Запуск стандартного процесса Houdini)
+    # В Houdini 21 НЕЛЬЗЯ обновлять UI через processEvents внутри этого блока
+    try:
+        opts = nd['flipbook_options']
+        opts.frameRange((nd['framelist'][0], nd['framelist'][-1]))
+        scene_view.flipbook(scene_view.curViewport(), opts)
+        
+        # Ручное обновление прогресса после завершения захвата
+        flipUI.calcPercentage(nd['flipfolder']) 
+    except Exception as e:
+        print(f"Render Interrupted or Failed: {e}")
+        return
+
+    # 4. КОДИРОВАНИЕ (FFMPEG)
+    if 'cmd' in nd:
+        set_nfo(n, "Encoding...", 0)
+        try:
+            # Выполняем синхронно, чтобы не перегружать графический поток
+            subprocess.run(nd['cmd'], check=True, capture_output=True)
+            set_nfo(n, 'SAVED: ' + os.path.basename(nd['postpath']), 0)
+            flipUI.completedset(flipUI.data[nd['flipfolder']])
+        except Exception as e:
+            set_nfo(n, f'FFMPEG Error: {e}', 1)
+
+    # 5. Сохранение копии проекта
+    if nd['saveHIP']:
+        saveCopy(os.path.dirname(nd['postpath']))
+
+def saveCopy(dest):
+    """Исправленное сохранение копии .hip [cite: 196]"""
+    try:
+        hip_path = hou.hipFile.path()
+        if not os.path.exists(dest): os.makedirs(dest)
+        target = os.path.join(dest, hou.hipFile.basename())
+        shutil.copy(hip_path, target)
+    except:
+        pass
+
+def set_nfo(n, msg_text, err):
+    """Установка текста в параметр Info [cite: 197]"""
+    if err: msg_text = 'ERROR: %s' % msg_text
+    with hou.undos.disabler():
+        n.parm('info').set(msg_text)
+
+def msg(n_text, t_bool):
+    """Вспомогательное сообщение пользователю [cite: 192]"""
+    severity = hou.severityType.Error if t_bool else hou.severityType.Message
+    hou.ui.displayMessage(n_text, severity=severity)

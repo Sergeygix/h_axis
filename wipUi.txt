@@ -1,0 +1,154 @@
+import hou, os, sys, PySide6, re, time, datetime, numpy, math, subprocess, shutil
+from PySide6 import QtCore, QtUiTools, QtWidgets, QtGui
+from PySide6.QtGui import *
+from PySide6.QtWidgets import *
+from PySide6.QtCore import *
+
+# Класс потока теперь использует Сигналы (безопасно для Qt6)
+class encodethread(QThread):
+    status_signal = Signal(str, str) # путь к папке, текст статуса
+    finished_signal = Signal(dict)    # данные для завершения
+
+    def __init__(self, info):
+        super().__init__()
+        self.info = info # [node, cmd, flipUI, flipfolder, postpath, data]
+
+    def run(self):
+        node, cmd, flipUI, flipfolder, postpath, data = self.info
+        self.status_signal.emit(flipfolder, "Encoding...")
+        
+        try:
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            process.communicate()
+            
+            if os.path.isfile(postpath):
+                # Для записи в инфо-порт ноды используем выполнение в основном потоке
+                self.status_signal.emit(flipfolder, "Complete")
+            
+            # Удаление временных файлов (опционально)
+            # shutil.rmtree(flipfolder)
+            self.finished_signal.emit(data)
+            
+        except Exception as e:
+            print(f"Encoding thread error: {e}")
+
+class flipWidget(QWidget):
+    def __init__(self):
+        super(flipWidget, self).__init__()
+        self.prog = QProgressBar()
+        self.prog.setStyleSheet("QProgressBar::chunk {background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgb(80,80,80), stop:1 rgb(120,120,120));}")
+        self.prog.setMinimumWidth(0)
+        self.prog.setValue(0)
+        self.prog.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        mode_layout = QHBoxLayout()
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.addWidget(self.prog)
+        self.setLayout(mode_layout)
+
+class wipUITable(QTableWidget):
+    def __init__(self):
+        super(wipUITable, self).__init__()
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+# ... (код wipUITable остается без изменений до класса flipbook_ui)
+
+class flipbook_ui(QtWidgets.QFrame):
+    def __init__(self):
+        super(flipbook_ui, self).__init__()
+        self.setWindowTitle('Flipbook Manager')
+        self.resize(500, 300)
+        self.escclicked = False
+        self.print_progress = False
+        
+        # Привязка к главному окну Houdini
+        self.setParent(hou.ui.mainQtWindow(), QtCore.Qt.Window)
+        self.setStyleSheet(hou.ui.qtStyleSheet())
+        
+        layout = QVBoxLayout(self)
+        self.tasksGroupBox = QGroupBox("Tasks")
+        layout.addWidget(self.tasksGroupBox)
+        
+        grid_layout = QHBoxLayout(self.tasksGroupBox)
+        self.queue = wipUITable()
+        self.queue.setColumnCount(3)
+        self.queue.setHorizontalHeaderLabels(["Node", "Status", "Progress"])
+        self.queue.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        grid_layout.addWidget(self.queue)
+        
+        # Индикаторы времени
+        timers_layout = QHBoxLayout()
+        self.overall = QProgressBar()
+        self.elapsed = QLabel("00:00:00")
+        self.remaining = QLabel("00:00:00")
+        timers_layout.addWidget(QLabel("Elapsed:"))
+        timers_layout.addWidget(self.elapsed)
+        timers_layout.addWidget(QLabel("Remaining:"))
+        timers_layout.addWidget(self.remaining)
+        layout.addLayout(timers_layout)
+        layout.addWidget(self.overall)
+
+        self.create_fswatcher()
+
+    def create_fswatcher(self):
+        self._fs_watcher = QFileSystemWatcher()
+        self._fs_watcher.directoryChanged.connect(self.calcPercentage)
+
+    def reset(self, data):
+        self.clearWatcher()
+        self.queue.setRowCount(0)
+        self.overall.setValue(0)
+        self.data = data
+        self.starttime = time.time()
+        self.lasttime = self.starttime
+        self.completedFrames = 0
+        self.allFrames = 0
+        self.load_flips()
+
+    def load_flips(self):
+        keys = list(self.data.keys())
+        self._fs_watcher.addPaths(keys)
+        
+        for idx, path in enumerate(keys):
+            node = self.data[path]['node']
+            self.allFrames += self.data[path]['total']
+            
+            self.queue.insertRow(idx)
+            # Иконка (упрощено для стабильности в Qt6)
+            item_node = QTableWidgetItem(node.path())
+            self.queue.setItem(idx, 0, item_node)
+            
+            item_status = QTableWidgetItem("Ready")
+            self.queue.setItem(idx, 1, item_status)
+            
+            widget = flipWidget()
+            self.queue.setCellWidget(idx, 2, widget)
+            
+            self.data[path].update({'w': widget, 'count': 0, 'row': item_status})
+
+    def calcPercentage(self, path):
+        if path not in self.data: return
+        data = self.data[path]
+        data['count'] += 1
+        self.completedFrames += 1
+        
+        # Обновление прогресс-бара
+        val = int((data['count'] / data['total']) * 100)
+        data['w'].prog.setValue(val)
+        
+        overall_val = int((self.completedFrames / self.allFrames) * 100)
+        self.overall.setValue(overall_val)
+        
+        # Обновление времени
+        elapsed = time.time() - self.starttime
+        self.elapsed.setText(str(datetime.timedelta(seconds=int(elapsed))))
+
+    def clearWatcher(self):
+        if self._fs_watcher.directories():
+            self._fs_watcher.removePaths(self._fs_watcher.directories())
+
+    def update_status_from_thread(self, path, text):
+        if path in self.data:
+            self.data[path]['row'].setText(text)
+
+    def completedset(self, data):
+        data['row'].setText("Complete")
